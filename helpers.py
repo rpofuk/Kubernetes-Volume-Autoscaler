@@ -25,22 +25,34 @@ def detectPrometheusURL():
     return "http://{}:{}".format(prometheus_ip_address,prometheus_port)
 
 # Input/configuration variables
-INTERVAL_TIME = int(getenv('INTERVAL_TIME') or 60)                               # How often (in seconds) to scan prometheus for checking if we need to resize
-SCALE_ABOVE_PERCENT = int(getenv('SCALE_ABOVE_PERCENT') or 80)                   # What percent out of 100 the volume must be consuming before considering to scale it
-SCALE_AFTER_INTERVALS = int(getenv('SCALE_AFTER_INTERVALS') or 5)                # How many intervals of INTERVAL_TIME a volume must be above SCALE_ABOVE_PERCENT before we scale
-SCALE_UP_PERCENT = int(getenv('SCALE_UP_PERCENT') or 20)                         # How much percent of the current volume size to scale up by.  eg: 100 == (if disk is 10GB, scale to 20GB), eg: 20 == (if disk is 10GB, scale to 12GB)
-SCALE_UP_MIN_INCREMENT = int(getenv('SCALE_UP_MIN_INCREMENT') or 1000000000)     # How many bytes is the minimum that we can resize up by, default is 1GB (in bytes, so 1000000000)
-SCALE_UP_MAX_INCREMENT = int(getenv('SCALE_UP_MAX_INCREMENT') or 16000000000000) # How many bytes is the maximum that we can resize up by, default is 16TB (in bytes, so 16000000000000)
-SCALE_UP_MAX_SIZE = int(getenv('SCALE_UP_MAX_SIZE') or 16000000000000)           # How many bytes is the maximum disk size that we can resize up, default is 16TB for EBS volumes in AWS (in bytes, so 16000000000000)
-SCALE_COOLDOWN_TIME = int(getenv('SCALE_COOLDOWN_TIME') or 22200)                # How long (in seconds) we must wait before scaling this volume again.  For AWS EBS, this is 6 hours which is 21600 seconds but for good measure we add an extra 10 minutes to this, so 22200
-PROMETHEUS_URL = getenv('PROMETHEUS_URL') or detectPrometheusURL()               # Where prometheus is, if not provided it can auto-detect it if it's in the same namespace as us
-DRY_RUN = True if getenv('DRY_RUN', "false").lower() == "true" else False        # If we want to dry-run this
-PROMETHEUS_LABEL_MATCH = getenv('PROMETHEUS_LABEL_MATCH') or ''                  # A PromQL label query to restrict volumes for this to see and scale, without braces.  eg: 'namespace="dev"'
-HTTP_TIMEOUT = int(getenv('HTTP_TIMEOUT', "15")) or 15                           # Allows to set the timeout for calls to Prometheus and Kubernetes.  This might be needed if your Prometheus or Kubernetes is over a remote WAN link with high latency and/or is heavily loaded
-PROMETHEUS_VERSION = "0.0.0"                                                     # Used to detect the availability of a new function called present_over_time only available on Prometheus v2.30.0 or newer, this is auto-detected and updated, not set by a user
-VERBOSE = True if getenv('VERBOSE', "false").lower() == "true" else False        # If we want to verbose mode
-VICTORIAMETRICS_COMPAT = True if getenv('VICTORIAMETRICS_MODE', "false").lower() == "true" else False # Whether to skip the prometheus check and assume victoriametrics
-SCOPE_ORGID_AUTH_HEADER = getenv('SCOPE_ORGID_AUTH_HEADER') or ''                # If we want to use Mimir or AgentMode which requires an orgid header.  See: https://grafana.com/docs/mimir/latest/references/http-api/#authentication
+class Config:
+  def __init__(self, name, age):
+     self.interval_time =  get_env_var_or_default('INTERVAL_TIME', 60),
+     self.scale_above_percent =  get_env_var_or_default('SCALE_ABOVE_PERCENT', 80),
+     self.scale_after_intervals =  get_env_var_or_default('SCALE_AFTER_INTERVALS', 5),
+     self.scale_up_percent =  get_env_var_or_default('SCALE_UP_PERCENT', 20),
+     self.scale_up_min_increment =  get_env_var_or_default('SCALE_UP_MIN_INCREMENT', 1000000000),
+     self.scale_up_max_increment =  get_env_var_or_default('SCALE_UP_MAX_INCREMENT', 16000000000000),
+     self.scale_up_max_size =  get_env_var_or_default('SCALE_UP_MAX_SIZE', 16000000000000),
+     self.scale_cooldown_time =  get_env_var_or_default('SCALE_COOLDOWN_TIME', 22200),
+     self.prometheus_url =  os.getenv('PROMETHEUS_URL') or detectPrometheusURL(),  # Assuming you have a function detectPrometheusURL()
+     self.dry_run =  os.getenv('DRY_RUN', "false").lower() == "true",
+     self.prometheus_label_match =  os.getenv('PROMETHEUS_LABEL_MATCH') or '',
+     self.http_timeout =  get_env_var_or_default('HTTP_TIMEOUT', 15),
+     self.prometheus_version =  "0.0.0",  # This seems to be auto-detected, so keeping it as is
+     self.is_verbose =  os.getenv('VERBOSE', "false").lower() == "true",
+     self.victoriametrics_compat =  os.getenv('VICTORIAMETRICS_MODE', "false").lower() == "true",
+     self.scope_orgid_auth_header =  os.getenv('SCOPE_ORGID_AUTH_HEADER') or ''
+
+     # Set headers if desired from above
+     self.headers = {}
+     if len(self.scope_orgid_auth_header) > 0:
+        self.headers['X-Scope-OrgID'] = SCOPE_ORGID_AUTH_HEADER
+
+
+    
+def init_config():
+    return Config()
 
 
 # Simple helper to pass back
@@ -62,10 +74,6 @@ def get_settings_for_prometheus_metrics():
         'verbose_enabled': "true" if VERBOSE else "false",
     }
 
-# Set headers if desired from above
-headers = {}
-if len(SCOPE_ORGID_AUTH_HEADER) > 0:
-    headers['X-Scope-OrgID'] = SCOPE_ORGID_AUTH_HEADER
 
 # This handler helps handle sigint/term gracefully (not in the middle of an runloop)
 class GracefulKiller:
@@ -453,7 +461,7 @@ def scale_up_pvc(namespace, name, new_size):
 
 
 # Test if prometheus is accessible, and gets the build version so we know which function(s) are available or not, primarily for present_over_time below
-def testIfPrometheusIsAccessible(url):
+def testIfPrometheusIsAccessible(config):
     global PROMETHEUS_VERSION
     if VICTORIAMETRICS_COMPAT:
       # Victoriametrics roughly resembles a very recent prometheus
@@ -461,7 +469,7 @@ def testIfPrometheusIsAccessible(url):
       return # Victoria doesn't export stats/buildinfo endpoint, so just assume it's accessible.
 
     try:
-        response = requests.get(url + '/api/v1/status/buildinfo', timeout=HTTP_TIMEOUT, headers=headers)
+        response = requests.get(config.prometheuus_url + '/api/v1/status/buildinfo', timeout=HTTP_TIMEOUT, headers=config.headers)
         if response.status_code != 200:
             raise Exception("ERROR: Received status code {} while trying to initialize on Prometheus: {}".format(response.status_code, url))
         response_object = response.json()
@@ -473,7 +481,8 @@ def testIfPrometheusIsAccessible(url):
 
 
 # Get a list of PVCs from Prometheus with their metrics of disk usage
-def fetch_pvcs_from_prometheus(url, label_match=PROMETHEUS_LABEL_MATCH):
+def fetch_pvcs_from_prometheus(config: Config):
+    label_match=config.prometheus_label_match
 
     # This only works on Prometheus v2.30.0 or newer, using this helps prevent false-negatives only returning recent pvcs (in the last hour)
     if version.parse(PROMETHEUS_VERSION) >= version.parse("2.30.0"):

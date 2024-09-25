@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import os
 import time
-from helpers import INTERVAL_TIME, PROMETHEUS_URL, DRY_RUN, VERBOSE, get_settings_for_prometheus_metrics, is_integer_or_float, print_human_readable_volume_dict
-from helpers import convert_bytes_to_storage, scale_up_pvc, testIfPrometheusIsAccessible, describe_all_pvcs, send_kubernetes_event
-from helpers import fetch_pvcs_from_prometheus, printHeaderAndConfiguration, calculateBytesToScaleTo, GracefulKiller, cache
+import helpers
+from helpers import convert_bytes_to_storage, scale_up_pvc, describe_all_pvcs, send_kubernetes_event
+from helpers import printHeaderAndConfiguration, calculateBytesToScaleTo, GracefulKiller, cache
 from prometheus_client import start_http_server, Summary, Gauge, Counter, Info
 import slack
 import sys, traceback
@@ -25,38 +25,12 @@ PROMETHEUS_METRICS['num_pvcs_below_threshold'].set(0)
 PROMETHEUS_METRICS['info'] = Info('volume_autoscaler_release', 'Release/version information about this volume autoscaler service')
 PROMETHEUS_METRICS['info'].info({'version': '1.0.7'})
 PROMETHEUS_METRICS['settings'] = Info('volume_autoscaler_settings', 'Settings currently used in this service')
-PROMETHEUS_METRICS['settings'].info(get_settings_for_prometheus_metrics())
+PROMETHEUS_METRICS['settings'].info(helpers.get_settings_for_prometheus_metrics())
 
 # Other globals
 MAIN_LOOP_TIME = 1
 
-# Entry point and main application loop
-if __name__ == "__main__":
-
-    # Test if our prometheus URL works before continuing
-    testIfPrometheusIsAccessible(PROMETHEUS_URL)
-
-    # Startup our prometheus metrics endpoint
-    start_http_server(8000)
-
-    # TODO: Test k8s access, or just test on-the-fly below?
-
-    # Reporting our configuration to the end-user
-    printHeaderAndConfiguration()
-
-    # Setup our graceful handling of kubernetes signals
-    killer = GracefulKiller()
-    last_run = 0
-
-    # Our main run loop, now using a signal handler to handle kubernetes signals gracefully (not mid-loop)
-    while not killer.kill_now:
-
-        # If it's not our interval time yet, only run once every INTERVAL_TIME seconds.  This extra bit helps us handle signals gracefully quicker
-        if int(time.time()) - last_run <= INTERVAL_TIME:
-            time.sleep(MAIN_LOOP_TIME)
-            continue
-        last_run = int(time.time())
-
+def run_loop(config):
         # In every loop, fetch all our pvcs state from Kubernetes
         try:
             PROMETHEUS_METRICS['resize_evaluated'].inc()
@@ -65,18 +39,18 @@ if __name__ == "__main__":
             print("Exception while trying to describe all PVCs")
             traceback.print_exc()
             time.sleep(MAIN_LOOP_TIME)
-            continue
+            return
 
         # Fetch our volume usage from Prometheus
         try:
-            pvcs_in_prometheus = fetch_pvcs_from_prometheus(url=PROMETHEUS_URL)
+            pvcs_in_prometheus = helpers.fetch_pvcs_from_prometheus(config)
             print("Querying and found {} valid PVCs to assess in prometheus".format(len(pvcs_in_prometheus)))
             PROMETHEUS_METRICS['num_valid_pvcs'].set(len(pvcs_in_prometheus))
         except Exception:
             print("Exception while trying to fetch PVC metrics from prometheus")
             traceback.print_exc()
             time.sleep(MAIN_LOOP_TIME)
-            continue
+            return
 
         # Iterate through every item and handle it accordingly
         PROMETHEUS_METRICS['num_pvcs_above_threshold'].set(0)  # Reset these each loop
@@ -91,7 +65,7 @@ if __name__ == "__main__":
                 # Precursor check to ensure we have info for this pvc in kubernetes object
                 if volume_description not in pvcs_in_kubernetes:
                     print("ERROR: The volume {} was not found in Kubernetes but had metrics in Prometheus.  This may be an old volume, was just deleted, or some random jitter is occurring.  If this continues to occur, please report an bug.  You might also be using an older version of Prometheus, please make sure you're using v2.30.0 or newer before reporting a bug for this.".format(volume_description))
-                    continue
+                    return
 
                 pvcs_in_kubernetes[volume_description]['volume_used_percent'] = volume_used_percent
                 try:
@@ -100,10 +74,10 @@ if __name__ == "__main__":
                     volume_used_inode_percent = -1
                 pvcs_in_kubernetes[volume_description]['volume_used_inode_percent'] = volume_used_inode_percent
 
-                if VERBOSE:
+                if config.is_verbose:
                     print("  VERBOSE DETAILS:")
                     print("-------------------------------------------------------------------------------------------------------------")
-                    print_human_readable_volume_dict(pvcs_in_kubernetes[volume_description])
+                    helpers.print_human_readable_volume_dict(pvcs_in_kubernetes[volume_description])
                     print("-------------------------------------------------------------------------------------------------------------")
                     print("Volume {} has {}% disk space used of the {} available".format(volume_description,volume_used_percent,pvcs_in_kubernetes[volume_description]['volume_size_status']))
                     if volume_used_inode_percent > -1:
@@ -113,13 +87,13 @@ if __name__ == "__main__":
                 if volume_used_percent < pvcs_in_kubernetes[volume_description]['scale_above_percent'] and volume_used_inode_percent < pvcs_in_kubernetes[volume_description]['scale_above_percent']:
                     PROMETHEUS_METRICS['num_pvcs_below_threshold'].inc()
                     cache.unset(volume_description)
-                    if VERBOSE:
+                    if config.is_verbose:
                         print("  and is not above {}% used".format(pvcs_in_kubernetes[volume_description]['scale_above_percent']))
                         if volume_used_inode_percent > -1:
                             print("  and is not above {}% inodes used".format(pvcs_in_kubernetes[volume_description]['scale_above_percent']))
-                    if VERBOSE:
+                    if config.is_verbose:
                         print("=============================================================================================================")
-                    continue
+                    return
                 else:
                     PROMETHEUS_METRICS['num_pvcs_above_threshold'].inc()
 
@@ -130,7 +104,7 @@ if __name__ == "__main__":
                     cache.set(volume_description, 1)
 
                 # Incase we aren't verbose, and didn't print this above, now that we're in alert we will print this
-                if not VERBOSE:
+                if not config.is_verbose:
                     print("Volume {} is {}% in-use of the {} available".format(volume_description,volume_used_percent,pvcs_in_kubernetes[volume_description]['volume_size_status']))
                     print("Volume {} is {}% inode in-use".format(volume_description,volume_used_inode_percent))
 
@@ -146,13 +120,13 @@ if __name__ == "__main__":
                     print("  BUT need to wait for {} intervals in alert before considering to scale".format( pvcs_in_kubernetes[volume_description]['scale_after_intervals'] ))
                     print("  FYI this has desired_size {} and current size {}".format( convert_bytes_to_storage(pvcs_in_kubernetes[volume_description]['volume_size_spec_bytes']), convert_bytes_to_storage(pvcs_in_kubernetes[volume_description]['volume_size_status_bytes'])))
                     print("=============================================================================================================")
-                    continue
+                    return
 
                 # If we are in a possible scale condition, check if we recently scaled it and handle accordingly
                 if pvcs_in_kubernetes[volume_description]['last_resized_at'] + pvcs_in_kubernetes[volume_description]['scale_cooldown_time'] >= int(time.mktime(time.gmtime())):
                     print("  BUT need to wait {} seconds to scale since the last scale time {} seconds ago".format( abs(pvcs_in_kubernetes[volume_description]['last_resized_at'] + pvcs_in_kubernetes[volume_description]['scale_cooldown_time']) - int(time.mktime(time.gmtime())), abs(pvcs_in_kubernetes[volume_description]['last_resized_at'] - int(time.mktime(time.gmtime()))) ))
                     print("=============================================================================================================")
-                    continue
+                    return
 
                 # If we reach this far then we will be scaling the disk, all preconditions were passed from above
                 if pvcs_in_kubernetes[volume_description]['last_resized_at'] == 0:
@@ -177,7 +151,7 @@ if __name__ == "__main__":
                     print("-------------------------------------------------------------------------------------------------------------")
                     print(pvcs_in_kubernetes[volume_description])
                     print("=============================================================================================================")
-                    continue
+                    return
 
                 # If our resize bytes is less than our original size (because the user set the max-bytes to something too low)
                 if resize_to_bytes < pvcs_in_kubernetes[volume_description]['volume_size_status_bytes']:
@@ -189,33 +163,33 @@ if __name__ == "__main__":
                     print("      Resize To: {} ({})".format(resize_to_bytes, convert_bytes_to_storage(resize_to_bytes)))
                     print("-------------------------------------------------------------------------------------------------------------")
                     print(" Volume causing failure:")
-                    print_human_readable_volume_dict(pvcs_in_kubernetes[volume_description])
+                    helpers.print_human_readable_volume_dict(pvcs_in_kubernetes[volume_description])
                     print("=============================================================================================================")
-                    continue
+                    return
 
                 # Check if we are already at the max volume size (either globally, or this-volume specific)
                 if resize_to_bytes == pvcs_in_kubernetes[volume_description]['volume_size_status_bytes']:
                     print("  SKIPPING scaling this because we are at the maximum size of {}".format(convert_bytes_to_storage(pvcs_in_kubernetes[volume_description]['scale_up_max_size'])))
                     print("=============================================================================================================")
-                    continue
+                    return
 
                 # Check if we set on this PV we want to ignore the volume autoscaler
                 if pvcs_in_kubernetes[volume_description]['ignore']:
                     print("  IGNORING scaling this because the ignore annotation was set to true")
                     print("=============================================================================================================")
-                    continue
+                    return
 
                 # Lets debounce this incase we did this resize last interval(s)
                 if cache.get(f"{volume_description}-has-been-resized"):
                     print("  DEBOUNCING and skipping this scaling, we resized within recent intervals")
                     print("=============================================================================================================")
-                    continue
+                    return
 
                 # Check if we are DRY-RUN-ing and won't do anything
-                if DRY_RUN:
+                if config.dry_run:
                     print("  DRY RUN was set, but we would have resized this disk from {} to {}".format(convert_bytes_to_storage(pvcs_in_kubernetes[volume_description]['volume_size_status_bytes']), convert_bytes_to_storage(resize_to_bytes)))
                     print("=============================================================================================================")
-                    continue
+                    return
 
                 # If we aren't dry-run, lets resize
                 PROMETHEUS_METRICS['resize_attempted'].inc()
@@ -226,7 +200,7 @@ if __name__ == "__main__":
                     convert_bytes_to_storage(pvcs_in_kubernetes[volume_description]['volume_size_status_bytes']),
                     convert_bytes_to_storage(resize_to_bytes),
                     pvcs_in_kubernetes[volume_description]['scale_above_percent'],
-                    cache.get(volume_description) * INTERVAL_TIME
+                    cache.get(volume_description) * config.interval_time
                 )
                 # Send event that we're starting to request a resize
                 send_kubernetes_event(
@@ -266,8 +240,38 @@ if __name__ == "__main__":
                 print(item)
                 traceback.print_exc()
 
-            if VERBOSE:
+            if config.is_verbose:
                 print("=============================================================================================================")
+
+# Entry point and main application loop
+if __name__ == "__main__":
+
+    
+    config = helpers.init_config()
+    # Test if our prometheus URL works before continuing
+    helpers.testIfPrometheusIsAccessible(config)
+
+    # Startup our prometheus metrics endpoint
+    start_http_server(8000)
+
+    # TODO: Test k8s access, or just test on-the-fly below?
+
+    # Reporting our configuration to the end-user
+    printHeaderAndConfiguration()
+
+    # Setup our graceful handling of kubernetes signals
+    killer = GracefulKiller()
+    last_run = 0
+
+    # Our main run loop, now using a signal handler to handle kubernetes signals gracefully (not mid-loop)
+    while not killer.kill_now:
+        # If it's not our interval time yet, only run once every INTERVAL_TIME seconds.  This extra bit helps us handle signals gracefully quicker
+        if int(time.time()) - last_run <= config.interval_time:
+            time.sleep(MAIN_LOOP_TIME)
+            continue
+        last_run = int(time.time())
+        run_loog(config)
+
 
         # Wait until our next interval
         time.sleep(MAIN_LOOP_TIME)

@@ -10,3 +10,8 @@ index.yaml
 *.patch
 for-release
 unused*
+.env
+#*
+.idea
+.#*
+*~

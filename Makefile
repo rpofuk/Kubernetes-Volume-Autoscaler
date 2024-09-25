@@ -7,6 +7,9 @@ SHELL = bash
 deps:
 	pip3 install -r requirements.txt
 
+test-deps:
+	pip3 install -r test_requirements.txt
+
 # This is our default logic for "make run" or "make start", to use the backgrounded.  This is dry-run'd to prevent it from doing anything while developing
 run: deps
 	@echo -e "\n----- Starting service locally -----"
@@ -33,10 +36,12 @@ lint: deps
 	black .
 
 test-local:
-	@echo -e "TODO - Add tests"
+	python3 -m unittest 
 
 help:
 	@echo -e "Makefile options possible\n------------------------------"
 	@echo -e "make deps    # Install dependencies"
 	@echo -e "make run     # Run service locally"
 	@echo -e "make start   # (alternate) Run service locally"
+
+
